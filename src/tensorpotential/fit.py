@@ -13,7 +13,345 @@ log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
 NUMPY_OPTIMIZERS = ['BFGS', 'L-BFGS-B', 'CG', 'trf', 'dogbox', 'lm', 'dual_annealing']
-TF_OPTIMIZERS = ['Adam', 'SGD']
+# Define optimizer categories
+TF_STANDARD_OPTIMIZERS = ['Adam', 'SGD']
+TF_ADAPTIVE_OPTIMIZERS = ['AdaptiveLRAdam']
+TF_OPTIMIZERS = TF_STANDARD_OPTIMIZERS + TF_ADAPTIVE_OPTIMIZERS
+
+
+import tensorflow.compat.v2 as tf
+from keras.saving.object_registration import register_keras_serializable
+
+@register_keras_serializable()
+class AdaptiveLRAdam(tf.keras.optimizers.Adam):
+    """
+    Adam optimizer with automatic learning rate adaptation.
+    
+    Reduces learning rate when loss increases beyond a threshold,
+    and periodically tests higher learning rates to escape plateaus.
+    """
+    
+    def __init__(
+        self,
+        learning_rate=0.001,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-7,
+        amsgrad=False,
+        percentage_threshold=1.0,
+        reduction_factor=0.5,
+        min_learning_rate=1e-8,
+        rescale_frequency=10,
+        max_consecutive_reductions=20,  # New parameter to prevent continuous degradation
+        name="AdaptiveLRAdam",
+        **kwargs
+    ):
+        super().__init__(
+            learning_rate=learning_rate,
+            beta_1=beta_1,
+            beta_2=beta_2,
+            epsilon=epsilon,
+            amsgrad=amsgrad,
+            name=name,
+            **kwargs
+        )
+        # Adaptive learning rate parameters
+        self.percentage_threshold = percentage_threshold / 100.0
+        self.reduction_factor = float(reduction_factor)
+        self.min_learning_rate = float(min_learning_rate)
+        self.rescale_frequency = int(rescale_frequency)
+        self.max_consecutive_reductions = int(max_consecutive_reductions)
+        
+        # Internal state
+        self.previous_loss = None
+        self.previous_weights = None
+        self.initial_learning_rate = float(self._get_current_lr())
+        self.lr_changes = 0
+        self.step_counter = 0
+        self.consecutive_reductions = 0
+        
+        # Support for model and training function
+        self.model = None
+        self.training_func = None
+        
+        # Log initialization
+        log.info(f"Initialized AdaptiveLRAdam with:")
+        log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
+        log.info(f"  - Beta_1 (momentum): {beta_1}")
+        log.info(f"  - Percentage threshold: {percentage_threshold}%")
+        log.info(f"  - Reduction factor: {self.reduction_factor}")
+        log.info(f"  - Minimum learning rate: {self.min_learning_rate}")
+        log.info(f"  - Rescale frequency: Every {self.rescale_frequency} steps")
+        log.info(f"  - Maximum consecutive reductions: {self.max_consecutive_reductions}")
+        
+    def register(self, model, training_func):
+        """Register model and training function for use in adaptive methods."""
+        self.model = model
+        self.training_func = training_func
+        log.info(f"Registered model and training function with AdaptiveLRAdam")
+        return self
+    
+    def _get_current_lr(self):
+        """Get current learning rate as a float value."""
+        if callable(self._learning_rate):
+            return float(self._learning_rate(self.iterations))
+        if hasattr(self._learning_rate, 'numpy'):
+            return float(self._learning_rate.numpy())
+        return float(self._learning_rate)
+    
+    def _set_lr(self, new_lr):
+        """Properly update learning rate."""
+        # Ensure new_lr is a float
+        new_lr = float(new_lr)
+        
+        # Set learning rate
+        K = tf.keras.backend
+        if hasattr(self, '_set_hyper'):
+            self._set_hyper('learning_rate', new_lr)
+        else:
+            K.set_value(self._learning_rate, new_lr)
+        
+        return new_lr
+        
+    def before_step(self):
+        """Save model state before training step."""
+        if self.model is None:
+            raise ValueError("Model not registered with AdaptiveLRAdam")
+            
+        current_lr = self._get_current_lr()
+        log.info(f"Current learning rate: {current_lr:.6f}")
+        self.previous_weights = self.model.get_coefs().numpy()
+        return self.previous_weights
+    
+    def after_step(self, current_loss):
+        """Process loss after training step and adjust learning rate if needed."""
+        if self.model is None or self.training_func is None:
+            raise ValueError("Model and training function not registered")
+            
+        should_redo = False
+        self.step_counter += 1
+        
+        # Try rescaling learning rate if it's time
+        if self.step_counter % self.rescale_frequency == 0:
+            self._try_lr_rescaling()
+            self.consecutive_reductions = 0  # Reset consecutive reductions after rescaling
+            
+        # Skip first step since we don't have a previous loss to compare
+        if self.previous_loss is not None:
+            # Calculate percentage increase
+            percent_change = (current_loss - self.previous_loss) / self.previous_loss * 100.0
+            
+            log.info(f"Loss change: {percent_change:.2f}% compared to previous step ({self.previous_loss:.6f})")
+            
+            # Check if loss increased beyond threshold percentage
+            if percent_change > self.percentage_threshold * 100.0:
+                # Check if we've had too many consecutive reductions
+                if self.consecutive_reductions >= self.max_consecutive_reductions:
+                    log.info(f"Already reduced learning rate {self.consecutive_reductions} times consecutively.")
+                    log.info(f"Skipping further reduction to prevent degradation.")
+                    self.consecutive_reductions = 0  # Reset counter
+                    self.previous_loss = current_loss  # Update previous loss
+                    return False
+                
+                current_lr = self._get_current_lr()
+                new_lr = max(current_lr * self.reduction_factor, self.min_learning_rate)
+                
+                # Update learning rate with verification
+                actual_new_lr = self._set_lr(new_lr)
+                self.lr_changes += 1
+                self.consecutive_reductions += 1
+                
+                log.info(f"ALERT: Loss increased by {percent_change:.2f}% (threshold: {self.percentage_threshold * 100:.2f}%)")
+                log.info(f"Reducing learning rate from {current_lr:.6f} to {actual_new_lr:.6f} (change #{self.lr_changes})")
+                
+                # Signal to redo the step
+                should_redo = True
+                # Don't update previous_loss yet
+                return should_redo
+                
+        # Normal step, update previous_loss
+        self.previous_loss = current_loss
+        # Reset consecutive reductions counter on successful step
+        self.consecutive_reductions = 0
+        return should_redo
+    
+    def redo_step(self):
+        """Redo training step with updated learning rate."""
+        if self.model is None or self.training_func is None:
+            raise ValueError("Model and training function not registered")
+            
+        if self.previous_weights is None:
+            log.warning("Cannot redo step: no previous weights saved")
+            return None
+        
+        # Restore previous weights
+        self.model.set_coefs(tf.convert_to_tensor(self.previous_weights))
+        
+        # Redo the step with the new, lower learning rate
+        loss = self.training_func()
+        log.info(f"Redone step completed with new loss: {loss:.6f}")
+        
+        # Check if redoing made things worse
+        if self.previous_loss is not None and loss > self.previous_loss:
+            log.warning(f"Warning: Loss increased after reducing learning rate.")
+            log.warning(f"Previous: {self.previous_loss:.6f}, New: {loss:.6f}")
+            
+        # Update previous loss to the new value
+        self.previous_loss = loss
+        return loss
+
+    def _try_lr_rescaling(self):
+        """Test higher learning rates to find better performance."""
+        if self.model is None or self.training_func is None:
+            return False
+            
+        log.info(f"Attempting learning rate rescaling to find optimal value")
+        
+        # Save current state
+        current_lr = self._get_current_lr()
+        original_weights = self.model.get_coefs().numpy()
+        original_loss = self.previous_loss
+        
+        if original_loss is None:
+            log.info("No previous loss available for comparison, skipping rescaling")
+            return False
+            
+        # Define potential learning rates to test (1.1x)
+        test_lrs = [current_lr*0.5, current_lr * 1.5]
+        best_lr = current_lr
+        best_loss = original_loss
+        
+        # Remember original learning rate to restore if needed
+        original_lr = current_lr
+
+        original_loss = self.redo_step()
+        log.info(f"Original learning rate={current_lr:.6f}, original loss={original_loss:.6f}")
+        
+        # Test each potential learning rate
+        for test_lr in test_lrs:
+            try:
+                # Set test learning rate
+                actual_test_lr = self._set_lr(test_lr)
+                log.info(f"Testing learning rate={actual_test_lr:.6f}")
+                
+                # Reset weights to original state
+                #self.model.set_coefs(tf.convert_to_tensor(original_weights))
+                
+                # Run training step with test learning rate
+                #test_loss = self.training_func()
+                test_loss = self.training_func()
+                test_loss = self.training_func()
+                log.info(f"Testing learning rate={actual_test_lr:.6f}, loss={test_loss:.6f} (previous best: {best_loss:.6f})")
+                
+                # We want significant improvement (at least 0.5% better)
+                improvement_pct = (best_loss - test_loss) / best_loss * 100.0
+                
+                if improvement_pct > 1e-7:  # Really should be in a ratio of previous to current loss 
+                    log.info(f"Found better learning rate: {actual_test_lr:.6f} (improvement: {improvement_pct:.2f}%)")
+                    best_lr = actual_test_lr
+                    best_loss = test_loss
+                else:
+                    log.info(f"Learning rate {actual_test_lr:.6f} did not provide significant improvement")
+                    
+            except Exception as e:
+                log.warning(f"Error testing learning rate {test_lr:.6f}: {str(e)}")
+            finally:
+                # Always restore original weights
+                self.model.set_coefs(tf.convert_to_tensor(original_weights))
+        
+        # Reset to original learning rate first 
+        self._set_lr(original_lr)
+        
+        # Apply the best learning rate if better than current
+        if best_lr != current_lr:
+            actual_new_lr = self._set_lr(best_lr)
+            log.info(f"Rescaled learning rate from {current_lr:.6f} to {actual_new_lr:.6f} for optimal performance")
+            return True
+        else:
+            log.info(f"Current learning rate {current_lr:.6f} is already optimal")
+            return False
+#    def _try_lr_rescaling(self):
+#        """Test higher learning rates to find better performance."""
+#        if self.model is None or self.training_func is None:
+#            return False
+#            
+#        log.info(f"Attempting learning rate rescaling to find optimal value")
+#        
+#        # Save current state
+#        current_lr = self._get_current_lr()
+#        original_weights = self.model.get_coefs().numpy()
+#        original_loss = self.previous_loss
+#        
+#        if original_loss is None:
+#            log.info("No previous loss available for comparison, skipping rescaling")
+#            return False
+#            
+#        # Define potential learning rates to test (2x and 4x current)
+#        test_lrs = [current_lr * 2.0, current_lr * 4.0]
+#        best_lr = current_lr
+#        best_loss = original_loss
+#        
+#        # Remember original learning rate to restore if needed
+#        original_lr = current_lr
+#        
+#        # Test each potential learning rate
+#        for test_lr in test_lrs:
+#            try:
+#                # Set test learning rate
+#                actual_test_lr = self._set_lr(test_lr)
+#                log.info(f"Testing learning rate={actual_test_lr:.6f}")
+#                
+#                # Reset weights to original state
+#                self.model.set_coefs(tf.convert_to_tensor(original_weights))
+#                
+#                # Run training step with test learning rate
+#                test_loss = self.training_func()
+#                
+#                log.info(f"Testing learning rate={actual_test_lr:.6f}, loss={test_loss:.6f} (previous best: {best_loss:.6f})")
+#                
+#                # We want significant improvement (at least 0.5% better)
+#                improvement_pct = (best_loss - test_loss) / best_loss * 100.0
+#                
+#                if improvement_pct > 0.5:  # Require at least 0.5% improvement
+#                    log.info(f"Found better learning rate: {actual_test_lr:.6f} (improvement: {improvement_pct:.2f}%)")
+#                    best_lr = actual_test_lr
+#                    best_loss = test_loss
+#                else:
+#                    log.info(f"Learning rate {actual_test_lr:.6f} did not provide significant improvement")
+#                    
+#            except Exception as e:
+#                log.warning(f"Error testing learning rate {test_lr:.6f}: {str(e)}")
+#            finally:
+#                # Always restore original weights
+#                self.model.set_coefs(tf.convert_to_tensor(original_weights))
+#        
+#        # Reset to original learning rate first 
+#        self._set_lr(original_lr)
+#        
+#        # Apply the best learning rate if better than current
+#        if best_lr != current_lr:
+#            actual_new_lr = self._set_lr(best_lr)
+#            log.info(f"Rescaled learning rate from {current_lr:.6f} to {actual_new_lr:.6f} for optimal performance")
+#            return True
+#        else:
+#            log.info(f"Current learning rate {current_lr:.6f} is already optimal")
+#            return False
+    
+    def log_summary(self):
+        """Log summary of learning rate adaptations."""
+        current_lr = self._get_current_lr()
+        log.info(f"Learning rate adaptation summary:")
+        log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
+        log.info(f"  - Final learning rate: {current_lr:.6f}")
+        log.info(f"  - Number of reductions: {self.lr_changes}")
+        log.info(f"  - Reduction factor: {self.reduction_factor}")
+        
+        return {
+            "initial_learning_rate": self.initial_learning_rate,
+            "final_learning_rate": current_lr,
+            "learning_rate_changes": self.lr_changes,
+            "reduction_factor": self.reduction_factor
+        }
 
 
 class FitTensorPotential:
@@ -124,17 +462,56 @@ class FitTensorPotential:
                                    callback=self.callback)
                 self.process_test_metric()
 
-            self.res_opt = res_opt
-            self.fit_coefs = res_opt.x
-            self.tensorpot.potential.set_coefs(self.fit_coefs)
-
         elif optimizer in TF_OPTIMIZERS:
-            self.opt = self.get_optimzer(optimizer)
-            for epoch in range(niter):
-                loss = self.tf_fit_func(batches)
+            if options is None:
+                options = {"learning_rate": 1e-3}
+            if "learning_rate" not in options:
+                options["learning_rate"] = 1e-3
+            log.info("Minimizer options: {}".format(options))
+        
+            # Define the training function that will be used
+            # This is defined once and can be passed to any optimizer that needs it
+            def training_step():
+                return self.tf_fit_func(batches)
+        
+            if optimizer in TF_STANDARD_OPTIMIZERS:
+                if optimizer == 'Adam':
+                    self.opt = tf.keras.optimizers.Adam(**options)
+                    log.info("Using standard Adam optimizer")
+                elif optimizer == 'SGD':
+                    self.opt = tf.keras.optimizers.SGD(**options)
+                    log.info("Using standard SGD optimizer")
+            elif optimizer in TF_ADAPTIVE_OPTIMIZERS:
+                if optimizer == 'AdaptiveLRAdam':
+                    log.info("Using AdaptiveLRAdam optimizer with automatic learning rate adjustment")
+                    self.opt = AdaptiveLRAdam(**options).register(
+                        model=self.tensorpot.potential,
+                        training_func=training_step
+                    )
 
+            # Main training loop
+            for epoch in range(niter):
+                # Adaptive optimizer pre-step
+                if hasattr(self.opt, 'before_step'):
+                    self.opt.before_step()
+                
+                # Common training step for all optimizers
+                loss = training_step()
+                
+                # Adaptive optimizer post-step
+                if hasattr(self.opt, 'after_step'):
+                    should_redo = self.opt.after_step(loss)
+                    if should_redo and hasattr(self.opt, 'redo_step'):
+                        loss = self.opt.redo_step()
+                
+                # Common finalization for all optimizers
                 self.fit_coefs = self.tensorpot.potential.get_coefs().numpy()
                 self.callback(self.fit_coefs)
+            
+            # Log summary at the end if optimizer supports it
+            if hasattr(self.opt, 'log_summary'):
+                self.opt.log_summary()
+                            
         else:
             raise ValueError("Unknown optimizer `{}`. Should be one of {}".format(optimizer, NUMPY_OPTIMIZERS+TF_OPTIMIZERS))
 
@@ -152,11 +529,6 @@ class FitTensorPotential:
             self.fit(df, batch_size=batch_size, optimizer=optimizer, coefs=self.fit_coefs, niter=niter,
                      jacobian_factor=jacobian_factor)
 
-    def get_optimzer(self, opt_name):
-        if opt_name == 'Adam':
-            optmzr = tf.keras.optimizers.Adam(learning_rate=1e-3)
-        elif opt_name == 'SGD':
-            optmzr = tf.keras.optimizers.SGD(learning_rate=1e-3)
 
         return optmzr
 
