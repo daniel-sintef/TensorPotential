@@ -1,5 +1,7 @@
 import logging
 import time
+from datetime import datetime
+import os
 
 import numpy as np
 import tensorflow as tf
@@ -20,15 +22,18 @@ TF_OPTIMIZERS = TF_STANDARD_OPTIMIZERS + TF_ADAPTIVE_OPTIMIZERS
 
 
 import tensorflow.compat.v2 as tf
-from keras.saving.object_registration import register_keras_serializable
+import logging
 
-@register_keras_serializable()
-class AdaptiveLRAdam(tf.keras.optimizers.Adam):
+
+class AdaptiveLRAdam:
     """
-    Adam optimizer with automatic learning rate adaptation.
+    Adaptive learning rate wrapper for Adam optimizer with crash detection and recovery.
     
-    Reduces learning rate when loss increases beyond a threshold,
-    and periodically tests higher learning rates to escape plateaus.
+    Features:
+    - Automatically detects loss spikes and recovers by reverting to previous checkpoint
+    - Periodically tests different learning rates to optimize convergence
+    - Uses TensorFlow's native checkpoint system
+    - Keeps the main training loop simple while handling recovery outside of it
     """
     
     def __init__(
@@ -37,321 +42,467 @@ class AdaptiveLRAdam(tf.keras.optimizers.Adam):
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-7,
-        amsgrad=False,
-        percentage_threshold=1.0,
-        reduction_factor=0.5,
-        min_learning_rate=1e-8,
-        rescale_frequency=10,
-        max_consecutive_reductions=20,  # New parameter to prevent continuous degradation
+        amsgrad=True,
+        # Crash detection parameters
+        crash_threshold=10.0,          # Loss increase percentage that triggers recovery
+        crash_recovery_lr_factor=0.5,  # Factor to reduce LR by when crash is detected
+        crash_rewind_steps=3,          # How many checkpoints to go back on crash
+        # Learning rate sweep parameters
+        sweep_frequency=50,            # Run LR sweep every N iterations
+        sweep_factors=[0.1, 2.0],      # Test these LR multipliers during sweeps
+        sweep_rewind_steps=3,          # Steps to go back when running sweeps
+        min_learning_rate=1e-6,        # Minimum allowed learning rate
+        max_learning_rate=1e-1,        # Maximum allowed learning rate
+        # Checkpoint parameters
+        checkpoint_frequency=1,        # Save checkpoint every N iterations
+        checkpoint_max_to_keep=100,    # Maximum number of checkpoints to retain
+        checkpoint_dir="./checkpoints",
         name="AdaptiveLRAdam",
-        **kwargs
     ):
-        super().__init__(
+        # Create the wrapped optimizer
+        self.optimizer = tf.keras.optimizers.Adam(
             learning_rate=learning_rate,
             beta_1=beta_1,
             beta_2=beta_2,
             epsilon=epsilon,
             amsgrad=amsgrad,
-            name=name,
-            **kwargs
+            name=name
         )
-        # Adaptive learning rate parameters
-        self.percentage_threshold = percentage_threshold / 100.0
-        self.reduction_factor = float(reduction_factor)
-        self.min_learning_rate = float(min_learning_rate)
-        self.rescale_frequency = int(rescale_frequency)
-        self.max_consecutive_reductions = int(max_consecutive_reductions)
+        
+        # Store configuration parameters
+        self.crash_threshold = crash_threshold / 100.0  # Convert to decimal
+        self.crash_recovery_lr_factor = crash_recovery_lr_factor
+        self.crash_rewind_steps = crash_rewind_steps
+        self.sweep_frequency = sweep_frequency
+        self.sweep_factors = sweep_factors
+        self.sweep_rewind_steps = sweep_rewind_steps
+        self.min_learning_rate = min_learning_rate
+        self.max_learning_rate = max_learning_rate
+        self.checkpoint_frequency = checkpoint_frequency
+        self.checkpoint_dir = os.path.join(checkpoint_dir, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        self.name = name
+        
+        # Create directories
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
+        # Setup logger
+        self.log = logging.getLogger(f"{name}")
+        self.log.setLevel(logging.INFO)
+        if not self.log.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.log.addHandler(handler)
         
         # Internal state
+        self.iteration = 0
         self.previous_loss = None
-        self.previous_weights = None
-        self.initial_learning_rate = float(self._get_current_lr())
+        self.initial_learning_rate = float(self._get_lr())
+        self.best_checkpoint_loss = float('inf')
+        self.best_checkpoint_path = None
+        self.checkpoints = []  # List of (step, path, loss) tuples
         self.lr_changes = 0
-        self.step_counter = 0
-        self.consecutive_reductions = 0
         
-        # Support for model and training function
+        # Checkpoint manager setup
+        self.checkpoint = None
+        self.ckpt_manager = None
+        
+        # Registered model and training function
         self.model = None
         self.training_func = None
         
-        # Log initialization
-        log.info(f"Initialized AdaptiveLRAdam with:")
-        log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
-        log.info(f"  - Beta_1 (momentum): {beta_1}")
-        log.info(f"  - Percentage threshold: {percentage_threshold}%")
-        log.info(f"  - Reduction factor: {self.reduction_factor}")
-        log.info(f"  - Minimum learning rate: {self.min_learning_rate}")
-        log.info(f"  - Rescale frequency: Every {self.rescale_frequency} steps")
-        log.info(f"  - Maximum consecutive reductions: {self.max_consecutive_reductions}")
-        
+        self.log.info(f"Initialized {self.name} with the following configuration:")
+        self.log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
+        self.log.info(f"  - Crash detection threshold: {crash_threshold}%")
+        self.log.info(f"  - Crash recovery LR factor: {crash_recovery_lr_factor}")
+        self.log.info(f"  - Sweep frequency: Every {sweep_frequency} iterations")
+        self.log.info(f"  - Checkpoint frequency: Every {checkpoint_frequency} iterations")
+        self.log.info(f"  - Checkpoint directory: {self.checkpoint_dir}")
+    
     def register(self, model, training_func):
-        """Register model and training function for use in adaptive methods."""
+        """
+        Register model and training function for adaptive methods.
+        
+        Args:
+            model: The model being trained
+            training_func: Function that runs a single training step and returns loss
+                           Should have signature: () -> loss_value
+        
+        Returns:
+            self: For method chaining
+        """
         self.model = model
         self.training_func = training_func
-        log.info(f"Registered model and training function with AdaptiveLRAdam")
+        
+        # Setup checkpointing
+        self.checkpoint = tf.train.Checkpoint(
+            optimizer=self.optimizer,
+            optimizer_iteration=tf.Variable(0, trainable=False)
+        )
+        
+        self.ckpt_manager = tf.train.CheckpointManager(
+            self.checkpoint,
+            self.checkpoint_dir,
+            max_to_keep=100,  # Keep more checkpoints for recovery
+            checkpoint_name="ckpt"
+        )
+        
+        self.log.info(f"Registered model and training function with {self.name}")
         return self
     
-    def _get_current_lr(self):
+    def _get_lr(self):
         """Get current learning rate as a float value."""
-        if callable(self._learning_rate):
-            return float(self._learning_rate(self.iterations))
-        if hasattr(self._learning_rate, 'numpy'):
-            return float(self._learning_rate.numpy())
-        return float(self._learning_rate)
+        lr = self.optimizer.learning_rate
+        if callable(lr):
+            return float(lr(self.optimizer.iterations))
+        if hasattr(lr, 'numpy'):
+            return float(lr.numpy())
+        return float(lr)
     
     def _set_lr(self, new_lr):
-        """Properly update learning rate."""
-        # Ensure new_lr is a float
-        new_lr = float(new_lr)
-        
-        # Set learning rate
-        K = tf.keras.backend
-        if hasattr(self, '_set_hyper'):
-            self._set_hyper('learning_rate', new_lr)
-        else:
-            K.set_value(self._learning_rate, new_lr)
-        
+        """Set learning rate to the given value, respecting minimum bounds."""
+        new_lr = float(max(new_lr, self.min_learning_rate))
+        new_lr = float(min(new_lr, self.max_learning_rate))
+        tf.keras.backend.set_value(self.optimizer.learning_rate, new_lr)
         return new_lr
-        
-    def before_step(self):
-        """Save model state before training step."""
-        if self.model is None:
-            raise ValueError("Model not registered with AdaptiveLRAdam")
-            
-        current_lr = self._get_current_lr()
-        log.info(f"Current learning rate: {current_lr:.6f}")
-        self.previous_weights = self.model.get_coefs().numpy()
-        return self.previous_weights
     
-    def after_step(self, current_loss):
-        """Process loss after training step and adjust learning rate if needed."""
-        if self.model is None or self.training_func is None:
-            raise ValueError("Model and training function not registered")
-            
-        should_redo = False
-        self.step_counter += 1
+    def _save_checkpoint(self, loss):
+        """Save checkpoint and record metadata about it."""
+        if self.checkpoint is None:
+            raise ValueError(f"Model not registered with {self.name}")
         
-        # Try rescaling learning rate if it's time
-        if self.step_counter % self.rescale_frequency == 0:
-            self._try_lr_rescaling()
-            self.consecutive_reductions = 0  # Reset consecutive reductions after rescaling
-            
-        # Skip first step since we don't have a previous loss to compare
-        if self.previous_loss is not None:
-            # Calculate percentage increase
-            percent_change = (current_loss - self.previous_loss) / self.previous_loss * 100.0
-            
-            log.info(f"Loss change: {percent_change:.2f}% compared to previous step ({self.previous_loss:.6f})")
-            
-            # Check if loss increased beyond threshold percentage
-            if percent_change > self.percentage_threshold * 100.0:
-                # Check if we've had too many consecutive reductions
-                if self.consecutive_reductions >= self.max_consecutive_reductions:
-                    log.info(f"Already reduced learning rate {self.consecutive_reductions} times consecutively.")
-                    log.info(f"Skipping further reduction to prevent degradation.")
-                    self.consecutive_reductions = 0  # Reset counter
-                    self.previous_loss = current_loss  # Update previous loss
-                    return False
-                
-                current_lr = self._get_current_lr()
-                new_lr = max(current_lr * self.reduction_factor, self.min_learning_rate)
-                
-                # Update learning rate with verification
-                actual_new_lr = self._set_lr(new_lr)
-                self.lr_changes += 1
-                self.consecutive_reductions += 1
-                
-                log.info(f"ALERT: Loss increased by {percent_change:.2f}% (threshold: {self.percentage_threshold * 100:.2f}%)")
-                log.info(f"Reducing learning rate from {current_lr:.6f} to {actual_new_lr:.6f} (change #{self.lr_changes})")
-                
-                # Signal to redo the step
-                should_redo = True
-                # Don't update previous_loss yet
-                return should_redo
-                
-        # Normal step, update previous_loss
-        self.previous_loss = current_loss
-        # Reset consecutive reductions counter on successful step
-        self.consecutive_reductions = 0
-        return should_redo
+        checkpoint_path = self.ckpt_manager.save()
+        current_lr = self._get_lr()
+        
+        # Record checkpoint metadata
+        checkpoint_info = {
+            'path': checkpoint_path,
+            'iteration': self.iteration,
+            'loss': loss,
+            'learning_rate': current_lr,
+            'timestamp': time.time()
+        }
+        
+        self.checkpoints.append(checkpoint_info)
+        
+        # Update best checkpoint if this one has the lowest loss
+        if loss < self.best_checkpoint_loss:
+            self.best_checkpoint_loss = loss
+            self.best_checkpoint_path = checkpoint_path
+            self.log.info(f"New best checkpoint with loss {loss:.6f}")
+        
+        return checkpoint_path
     
-    def redo_step(self):
-        """Redo training step with updated learning rate."""
-        if self.model is None or self.training_func is None:
-            raise ValueError("Model and training function not registered")
-            
-        if self.previous_weights is None:
-            log.warning("Cannot redo step: no previous weights saved")
+    def _get_checkpoint_by_steps(self, steps_back):
+        """Get a checkpoint that is steps_back from the most recent one."""
+        if not self.checkpoints:
+            self.log.warning("No checkpoints available for rewind")
             return None
         
-        # Restore previous weights
-        self.model.set_coefs(tf.convert_to_tensor(self.previous_weights))
+        # Sort by iteration (most recent first)
+        sorted_checkpoints = sorted(self.checkpoints, key=lambda x: -x['iteration'])
         
-        # Redo the step with the new, lower learning rate
-        loss = self.training_func()
-        log.info(f"Redone step completed with new loss: {loss:.6f}")
-        
-        # Check if redoing made things worse
-        if self.previous_loss is not None and loss > self.previous_loss:
-            log.warning(f"Warning: Loss increased after reducing learning rate.")
-            log.warning(f"Previous: {self.previous_loss:.6f}, New: {loss:.6f}")
-            
-        # Update previous loss to the new value
-        self.previous_loss = loss
-        return loss
-
-    def _try_lr_rescaling(self):
-        """Test higher learning rates to find better performance."""
-        if self.model is None or self.training_func is None:
-            return False
-            
-        log.info(f"Attempting learning rate rescaling to find optimal value")
-        
-        # Save current state
-        current_lr = self._get_current_lr()
-        original_weights = self.model.get_coefs().numpy()
-        original_loss = self.previous_loss
-        
-        if original_loss is None:
-            log.info("No previous loss available for comparison, skipping rescaling")
-            return False
-            
-        # Define potential learning rates to test (1.1x)
-        test_lrs = [current_lr*0.5, current_lr * 1.5]
-        best_lr = current_lr
-        best_loss = original_loss
-        
-        # Remember original learning rate to restore if needed
-        original_lr = current_lr
-
-        original_loss = self.redo_step()
-        log.info(f"Original learning rate={current_lr:.6f}, original loss={original_loss:.6f}")
-        
-        # Test each potential learning rate
-        for test_lr in test_lrs:
-            try:
-                # Set test learning rate
-                actual_test_lr = self._set_lr(test_lr)
-                log.info(f"Testing learning rate={actual_test_lr:.6f}")
-                
-                # Reset weights to original state
-                #self.model.set_coefs(tf.convert_to_tensor(original_weights))
-                
-                # Run training step with test learning rate
-                #test_loss = self.training_func()
-                test_loss = self.training_func()
-                test_loss = self.training_func()
-                log.info(f"Testing learning rate={actual_test_lr:.6f}, loss={test_loss:.6f} (previous best: {best_loss:.6f})")
-                
-                # We want significant improvement (at least 0.5% better)
-                improvement_pct = (best_loss - test_loss) / best_loss * 100.0
-                
-                if improvement_pct > 1e-7:  # Really should be in a ratio of previous to current loss 
-                    log.info(f"Found better learning rate: {actual_test_lr:.6f} (improvement: {improvement_pct:.2f}%)")
-                    best_lr = actual_test_lr
-                    best_loss = test_loss
-                else:
-                    log.info(f"Learning rate {actual_test_lr:.6f} did not provide significant improvement")
-                    
-            except Exception as e:
-                log.warning(f"Error testing learning rate {test_lr:.6f}: {str(e)}")
-            finally:
-                # Always restore original weights
-                self.model.set_coefs(tf.convert_to_tensor(original_weights))
-        
-        # Reset to original learning rate first 
-        self._set_lr(original_lr)
-        
-        # Apply the best learning rate if better than current
-        if best_lr != current_lr:
-            actual_new_lr = self._set_lr(best_lr)
-            log.info(f"Rescaled learning rate from {current_lr:.6f} to {actual_new_lr:.6f} for optimal performance")
-            return True
+        if len(sorted_checkpoints) > steps_back:
+            return sorted_checkpoints[steps_back]
+        elif len(sorted_checkpoints) > 0:
+            # If we don't have enough checkpoints, use the oldest
+            return sorted_checkpoints[-1]
         else:
-            log.info(f"Current learning rate {current_lr:.6f} is already optimal")
-            return False
-#    def _try_lr_rescaling(self):
-#        """Test higher learning rates to find better performance."""
-#        if self.model is None or self.training_func is None:
-#            return False
-#            
-#        log.info(f"Attempting learning rate rescaling to find optimal value")
-#        
-#        # Save current state
-#        current_lr = self._get_current_lr()
-#        original_weights = self.model.get_coefs().numpy()
-#        original_loss = self.previous_loss
-#        
-#        if original_loss is None:
-#            log.info("No previous loss available for comparison, skipping rescaling")
-#            return False
-#            
-#        # Define potential learning rates to test (2x and 4x current)
-#        test_lrs = [current_lr * 2.0, current_lr * 4.0]
-#        best_lr = current_lr
-#        best_loss = original_loss
-#        
-#        # Remember original learning rate to restore if needed
-#        original_lr = current_lr
-#        
-#        # Test each potential learning rate
-#        for test_lr in test_lrs:
-#            try:
-#                # Set test learning rate
-#                actual_test_lr = self._set_lr(test_lr)
-#                log.info(f"Testing learning rate={actual_test_lr:.6f}")
-#                
-#                # Reset weights to original state
-#                self.model.set_coefs(tf.convert_to_tensor(original_weights))
-#                
-#                # Run training step with test learning rate
-#                test_loss = self.training_func()
-#                
-#                log.info(f"Testing learning rate={actual_test_lr:.6f}, loss={test_loss:.6f} (previous best: {best_loss:.6f})")
-#                
-#                # We want significant improvement (at least 0.5% better)
-#                improvement_pct = (best_loss - test_loss) / best_loss * 100.0
-#                
-#                if improvement_pct > 0.5:  # Require at least 0.5% improvement
-#                    log.info(f"Found better learning rate: {actual_test_lr:.6f} (improvement: {improvement_pct:.2f}%)")
-#                    best_lr = actual_test_lr
-#                    best_loss = test_loss
-#                else:
-#                    log.info(f"Learning rate {actual_test_lr:.6f} did not provide significant improvement")
-#                    
-#            except Exception as e:
-#                log.warning(f"Error testing learning rate {test_lr:.6f}: {str(e)}")
-#            finally:
-#                # Always restore original weights
-#                self.model.set_coefs(tf.convert_to_tensor(original_weights))
-#        
-#        # Reset to original learning rate first 
-#        self._set_lr(original_lr)
-#        
-#        # Apply the best learning rate if better than current
-#        if best_lr != current_lr:
-#            actual_new_lr = self._set_lr(best_lr)
-#            log.info(f"Rescaled learning rate from {current_lr:.6f} to {actual_new_lr:.6f} for optimal performance")
-#            return True
-#        else:
-#            log.info(f"Current learning rate {current_lr:.6f} is already optimal")
-#            return False
+            return None
+    
+    def _restore_checkpoint(self, checkpoint_info):
+        """Restore from a checkpoint."""
+        if self.checkpoint is None:
+            raise ValueError(f"Model not registered with {self.name}")
+        
+        checkpoint_path = checkpoint_info['path']
+        status = self.checkpoint.restore(checkpoint_path)
+        status.expect_partial()  # Don't complain about partial restores
+        
+        self.iteration = checkpoint_info['iteration']
+        self.previous_loss = checkpoint_info['loss']
+        
+        self.log.info(f"Restored checkpoint from iteration {self.iteration} with loss {self.previous_loss:.6f}")
+        return True
+    
+    def apply_gradients(self, grads_and_vars, name=None):
+        """Wrapper for optimizer.apply_gradients that increments iteration counter."""
+        result = self.optimizer.apply_gradients(grads_and_vars, name=name)
+        return result
+    
+    def after_step(self, current_loss):
+        """
+        Process loss after a training step, detect crashes, and manage checkpoints.
+        
+        Args:
+            current_loss: The loss value from the current training step
+            
+        Returns:
+            action: String indicating the action taken ('continue', 'crash_recovery', 'lr_sweep')
+            new_loss: The new loss value after any recovery or sweep actions
+        """
+        self.iteration += 1
+        action = 'continue'
+        
+        # Save checkpoint if it's time
+        if self.iteration % self.checkpoint_frequency == 0:
+            self._save_checkpoint(current_loss)
+            self.log.debug(f"Saved checkpoint at iteration {self.iteration}")
+        
+        # Skip first iteration (no previous loss to compare)
+        if self.previous_loss is None:
+            self.previous_loss = current_loss
+            return action, current_loss
+        
+        # Calculate percent change in loss
+        percent_change = (current_loss - self.previous_loss) / abs(self.previous_loss) * 100.0
+        self.log.debug(f"Loss change: {percent_change:.2f}% (from {self.previous_loss:.6f} to {current_loss:.6f})")
+        
+        # Check for loss spike (crash)
+        if percent_change > self.crash_threshold * 100.0:
+            self.log.warning(f"Loss spike detected! {percent_change:.2f}% increase exceeds threshold {self.crash_threshold*100:.2f}%")
+            new_loss = self._handle_crash()
+            if new_loss is not None:
+                action = 'crash_recovery'
+                current_loss = new_loss
+        
+        # Periodically run learning rate sweep
+        if self.iteration % self.sweep_frequency == 0 and len(self.checkpoints) >= self.sweep_rewind_steps:
+            self.log.info(f"Running scheduled learning rate sweep at iteration {self.iteration}")
+            new_loss = self._run_lr_sweep()
+            if new_loss is not None:
+                action = 'lr_sweep'
+                current_loss = new_loss
+        
+        # Update previous loss for next iteration
+        self.previous_loss = current_loss
+        return action, current_loss
+    
+    def _handle_crash(self):
+        """
+        Handle a loss spike by rewinding to an earlier checkpoint and reducing LR.
+        
+        Returns:
+            new_loss: Loss after recovery, or None if recovery wasn't possible
+        """
+        if len(self.checkpoints) < self.crash_rewind_steps:
+            self.log.warning(f"Not enough checkpoints ({len(self.checkpoints)}) to go back {self.crash_rewind_steps} steps")
+            return None
+        
+        # Get checkpoint to rewind to
+        checkpoint_info = self._get_checkpoint_by_steps(self.crash_rewind_steps)
+        if not checkpoint_info:
+            return None
+        
+        self.log.info(f"Crash recovery: Rewinding to iteration {checkpoint_info['iteration']}")
+        
+        # Restore the checkpoint
+        success = self._restore_checkpoint(checkpoint_info)
+        if not success:
+            self.log.error("Failed to restore checkpoint for crash recovery")
+            return None
+        
+        # Reduce learning rate
+        old_lr = self._get_lr()
+        new_lr = old_lr * self.crash_recovery_lr_factor
+        new_lr = self._set_lr(new_lr)
+        self.lr_changes += 1
+        
+        self.log.info(f"Reduced learning rate from {old_lr:.6f} to {new_lr:.6f} for crash recovery")
+        
+        # Run forward steps with new learning rate
+        new_loss = None
+        self.log.info(f"Re-running {self.crash_rewind_steps} steps with reduced learning rate")
+        
+        with self.log_section("CRASH_RECOVERY"):
+            for step in range(self.crash_rewind_steps):
+                new_loss = self.training_func()
+                self.log.info(f"Recovery step {step+1}/{self.crash_rewind_steps}, loss: {new_loss:.6f}")
+        
+        self.iteration += self.crash_rewind_steps
+        self._save_checkpoint(new_loss)
+        return new_loss
+    
+    def _run_lr_sweep(self):
+        """
+        Test different learning rates to find the optimal value.
+        
+        Returns:
+            new_loss: Loss after applying the best learning rate, or None if sweep wasn't completed
+        """
+        # Get checkpoint to start from
+        checkpoint_info = self._get_checkpoint_by_steps(self.sweep_rewind_steps)
+        if not checkpoint_info:
+            self.log.warning("No checkpoint available for LR sweep")
+            return None
+        
+        # Restore the checkpoint
+        success = self._restore_checkpoint(checkpoint_info)
+        if not success:
+            self.log.error("Failed to restore checkpoint for LR sweep")
+            return None
+        
+        # Keep track of the best learning rate
+        baseline_lr = checkpoint_info['learning_rate']
+        best_lr = baseline_lr
+        best_loss = checkpoint_info['loss']
+        
+        self.log.info(f"Learning rate sweep: Testing factors {self.sweep_factors} from base LR {baseline_lr:.6f}")
+        
+        # Test different learning rates
+        all_results = []
+        
+        with self.log_section("LR_SWEEP"):
+            # First test baseline (original) learning rate as reference
+            self._set_lr(baseline_lr)
+            baseline_final_loss = self._test_learning_rate(baseline_lr, "baseline")
+            all_results.append((baseline_lr, baseline_final_loss))
+            
+            # Test each factor
+            for factor in self.sweep_factors:
+                test_lr = baseline_lr * factor
+                
+                # Skip if below minimum learning rate
+                if test_lr < self.min_learning_rate:
+                    self.log.info(f"Skipping factor {factor} as it would result in LR {test_lr:.6f} below minimum {self.min_learning_rate:.6f}")
+                    continue
+                # Skip if above maximum learning rate
+                if test_lr > self.max_learning_rate:
+                    self.log.info(f"Skipping factor {factor} as it would result in LR {test_lr:.6f} above minimum {self.max_learning_rate:.6f}")
+                    continue
+                
+                # Restore checkpoint for clean comparison
+                self._restore_checkpoint(checkpoint_info)
+                
+                # Set test learning rate
+                self._set_lr(test_lr)
+                
+                # Test this learning rate
+                final_loss = self._test_learning_rate(test_lr, f"factor {factor}")
+                all_results.append((test_lr, final_loss))
+        
+        # Find the best learning rate
+        best_lr, best_loss = min(all_results, key=lambda x: x[1])
+        
+        # Apply the best learning rate
+        self.log.info(f"Best learning rate from sweep: {best_lr:.6f} with loss {best_loss:.6f}")
+        
+        # Only change if the best is not the baseline
+        if best_lr != baseline_lr:
+            # Restore checkpoint one last time
+            self._restore_checkpoint(checkpoint_info)
+            
+            # Set the best learning rate
+            self._set_lr(best_lr)
+            self.lr_changes += 1
+            
+            # Run forward steps with best learning rate
+            self.log.info(f"Running {self.sweep_rewind_steps} steps with best learning rate {best_lr:.6f}")
+            
+            with self.log_section("APPLYING_BEST_LR"):
+                for step in range(self.sweep_rewind_steps):
+                    best_loss = self.training_func()
+                    self.log.info(f"Forward step {step+1}/{self.sweep_rewind_steps}, loss: {best_loss:.6f}")
+            
+            self.iteration += self.sweep_rewind_steps
+            self._save_checkpoint(best_loss)
+            return best_loss
+        else:
+            self.log.info(f"Current learning rate {baseline_lr:.6f} is already optimal")
+            # Restore checkpoint and continue
+            self._restore_checkpoint(checkpoint_info)
+            return None
+    
+    def _test_learning_rate(self, lr, label):
+        """Test a learning rate by running multiple steps and returning the final loss."""
+        self.log.info(f"Testing LR={lr:.6f} ({label})")
+        
+        # Run multiple steps
+        final_loss = None
+        for step in range(self.sweep_rewind_steps):
+            final_loss = self.training_func()
+            self.log.info(f"  Step {step+1}/{self.sweep_rewind_steps}, loss: {final_loss:.6f}")
+        
+        self.log.info(f"  Final loss for LR={lr:.6f}: {final_loss:.6f}")
+        return final_loss
+    
+    def log_section(self, section_name):
+        """Context manager for clearly marking log sections."""
+        class LogSection:
+            def __init__(self, logger, name):
+                self.logger = logger
+                self.name = name
+            
+            def __enter__(self):
+                self.logger.info(f"===== BEGIN {self.name} =====")
+                return self
+            
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.logger.info(f"===== END {self.name} =====")
+        
+        return LogSection(self.log, section_name)
     
     def log_summary(self):
         """Log summary of learning rate adaptations."""
-        current_lr = self._get_current_lr()
-        log.info(f"Learning rate adaptation summary:")
-        log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
-        log.info(f"  - Final learning rate: {current_lr:.6f}")
-        log.info(f"  - Number of reductions: {self.lr_changes}")
-        log.info(f"  - Reduction factor: {self.reduction_factor}")
+        current_lr = self._get_lr()
+        self.log.info(f"Learning rate adaptation summary:")
+        self.log.info(f"  - Initial learning rate: {self.initial_learning_rate:.6f}")
+        self.log.info(f"  - Final learning rate: {current_lr:.6f}")
+        self.log.info(f"  - Number of learning rate changes: {self.lr_changes}")
+        self.log.info(f"  - Best loss achieved: {self.best_checkpoint_loss:.6f}")
+        self.log.info(f"  - Number of checkpoints: {len(self.checkpoints)}")
+        self.log.info(f"  - Best checkpoint path: {self.best_checkpoint_path}")
         
         return {
             "initial_learning_rate": self.initial_learning_rate,
             "final_learning_rate": current_lr,
             "learning_rate_changes": self.lr_changes,
-            "reduction_factor": self.reduction_factor
+            "best_loss": self.best_checkpoint_loss,
+            "checkpoints_saved": len(self.checkpoints),
+            "best_checkpoint_path": self.best_checkpoint_path
         }
+        
+    # Forward important optimizer properties to make this class act as an optimizer
+    @property
+    def iterations(self):
+        return self.optimizer.iterations
+        
+    def get_weights(self):
+        return self.optimizer.get_weights()
+        
+    def set_weights(self, weights):
+        return self.optimizer.set_weights(weights)
+        
+    @property
+    def learning_rate(self):
+        return self.optimizer.learning_rate
+        
+    @learning_rate.setter
+    def learning_rate(self, value):
+        self.optimizer.learning_rate = value
+        
+    @property
+    def lr(self):
+        return self.optimizer.learning_rate
+        
+    @lr.setter
+    def lr(self, value):
+        self.optimizer.learning_rate = value
+        
+    def get_config(self):
+        config = self.optimizer.get_config()
+        config.update({
+            "crash_threshold": self.crash_threshold * 100.0,
+            "crash_recovery_lr_factor": self.crash_recovery_lr_factor,
+            "crash_rewind_steps": self.crash_rewind_steps,
+            "sweep_frequency": self.sweep_frequency,
+            "sweep_factors": self.sweep_factors,
+            "sweep_rewind_steps": self.sweep_rewind_steps,
+            "min_learning_rate": self.min_learning_rate,
+            "checkpoint_frequency": self.checkpoint_frequency,
+            "checkpoint_dir": self.checkpoint_dir
+        })
+        return config
 
 
 class FitTensorPotential:
@@ -481,6 +632,12 @@ class FitTensorPotential:
                 elif optimizer == 'SGD':
                     self.opt = tf.keras.optimizers.SGD(**options)
                     log.info("Using standard SGD optimizer")
+
+                for epoch in range(niter):
+                    loss = self.tf_fit_func(batches)
+                    self.fit_coefs = self.tensorpot.potential.get_coefs().numpy()
+                    self.callback(self.fit_coefs)
+
             elif optimizer in TF_ADAPTIVE_OPTIMIZERS:
                 if optimizer == 'AdaptiveLRAdam':
                     log.info("Using AdaptiveLRAdam optimizer with automatic learning rate adjustment")
@@ -488,29 +645,17 @@ class FitTensorPotential:
                         model=self.tensorpot.potential,
                         training_func=training_step
                     )
+                # Simplified training loop for adaptive optimizer
+                for epoch in range(niter):
+                    # Run training step
+                    loss = training_step()
+                    # Let the optimizer handle crash detection and LR adjustment
+                    action, adjusted_loss = self.opt.after_step(loss)
+                    # Always update coefficients
+                    self.fit_coefs = self.tensorpot.potential.get_coefs().numpy()
+                    # Call the callback with current coefficients
+                    self.callback(self.fit_coefs)
 
-            # Main training loop
-            for epoch in range(niter):
-                # Adaptive optimizer pre-step
-                if hasattr(self.opt, 'before_step'):
-                    self.opt.before_step()
-                
-                # Common training step for all optimizers
-                loss = training_step()
-                
-                # Adaptive optimizer post-step
-                if hasattr(self.opt, 'after_step'):
-                    should_redo = self.opt.after_step(loss)
-                    if should_redo and hasattr(self.opt, 'redo_step'):
-                        loss = self.opt.redo_step()
-                
-                # Common finalization for all optimizers
-                self.fit_coefs = self.tensorpot.potential.get_coefs().numpy()
-                self.callback(self.fit_coefs)
-            
-            # Log summary at the end if optimizer supports it
-            if hasattr(self.opt, 'log_summary'):
-                self.opt.log_summary()
                             
         else:
             raise ValueError("Unknown optimizer `{}`. Should be one of {}".format(optimizer, NUMPY_OPTIMIZERS+TF_OPTIMIZERS))
